@@ -1,0 +1,24 @@
+name: Boe
+proyect: boe-summary
+program: boe-train.py
+method: grid
+parameters:
+  dataset_name:
+    value: VanoInvestigations/BOE_with_BERTIN_for_tokenize_2045
+  model_name:
+    values:
+      - bertin-project/bertin-gpt-j-6B
+      - bertin-project/BOLETIN
+  target_modules:
+    values:
+      - "q_proj,v_proj"
+      - "q_proj,k_proj,v_proj,o_proj"
+  max_steps:
+    value: 600
+  num_bit:
+    values:
+      - 4
+      - 8
+      - 16
+      - 32
+
