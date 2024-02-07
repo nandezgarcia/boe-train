@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
+import torch.nn as nn
 from accelerate import Accelerator
 from datasets import load_dataset
 from peft import LoraConfig
@@ -42,20 +43,14 @@ class ScriptArguments:
         default="VanoInvestigations/BOE_with_BERTIN_for_tokenize_2045", metadata={"help": "the dataset name"}
     )
     dataset_text_field: Optional[str] = field(default="text", metadata={"help": "the text field of the dataset"})
-    report_to: Optional[str] = field(default="wandb", metadata={"help": "use 'wandb' to log with wandb"})
     learning_rate: Optional[float] = field(default=1.41e-5, metadata={"help": "the learning rate"})
-    batch_size: Optional[int] = field(default=64, metadata={"help": "the batch size"})
-    seq_length: Optional[int] = field(default=2048, metadata={"help": "Input sequence length"})
-    gradient_accumulation_steps: Optional[int] = field(
-        default=16, metadata={"help": "the number of gradient accumulation steps"}
-    )
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
     load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 4 bits precision"})
     use_peft: Optional[bool] = field(default=False, metadata={"help": "Wether to use PEFT or not to train adapters"})
     trust_remote_code: Optional[bool] = field(default=False, metadata={"help": "Enable `trust_remote_code`"})
     output_dir: Optional[str] = field(default="output", metadata={"help": "the output directory"})
-    peft_lora_r: Optional[int] = field(default=64, metadata={"help": "the r parameter of the LoRA adapters"})
-    peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
+    peft_lora_r: Optional[int] = field(default=16, metadata={"help": "the r parameter of the LoRA adapters"})
+    peft_lora_alpha: Optional[int] = field(default=32, metadata={"help": "the alpha parameter of the LoRA adapters"})
     logging_steps: Optional[int] = field(default=1, metadata={"help": "the number of logging steps"})
     use_auth_token: Optional[bool] = field(default=True, metadata={"help": "Use HF auth token to access the model"})
     num_train_epochs: Optional[int] = field(default=3, metadata={"help": "the number of training epochs"})
@@ -90,25 +85,30 @@ script_args = parser.parse_args_into_dataclasses()[0]
 if script_args.num_bit == 4:
     bit_4 = True
     bit_8 = False
-    float_16 = False
-    script_args.use_peft = True
+    float_16 = True
+    batch = 16
     hub_model_id_str = script_args.model_name.split("/")[1] + "_4bit_" + str(len(script_args.target_modules))
 elif script_args.num_bit == 8:
     bit_4 = False
     bit_8 = True
     float_16 = True
-    script_args.use_peft = True
+    batch = 8
     hub_model_id_str = script_args.model_name.split("/")[1] + "_8bit_" + str(len(script_args.target_modules))
 elif script_args.num_bit == 16:
     bit_4 = False
     bit_8 = False
     float_16 = True
+    batch = 4
     hub_model_id_str = script_args.model_name.split("/")[1] + "_16bit_" + str(len(script_args.target_modules))
 elif script_args.num_bit == 32:
     bit_4 = False
     bit_8 = False
     float_16 = False
-    hub_model_id_str = script_args.model_name.split("/")[1] + "_16bit_" + str(len(script_args.target_modules))
+    batch = 4
+    hub_model_id_str = script_args.model_name.split("/")[1] + "_32bit_" + str(len(script_args.target_modules))
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 model = AutoModelForCausalLM.from_pretrained(
     script_args.model_name,
@@ -117,8 +117,61 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map='auto'
 )
 
-tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, truncation=True, seq_length=1021)
-tokenizer.add_special_tokens({'pad_token': '<pad>'})
+tokenizer = AutoTokenizer.from_pretrained(script_args.model_name)
+tokenizer.pad_token = tokenizer.eos_token
+
+
+for param in model.parameters():
+  param.requires_grad = False  # freeze the model - train adapters later
+  if param.ndim == 1:
+    # cast the small parameters (e.g. layernorm) to fp32 for stability
+    param.data = param.data.to(torch.float32)
+
+model.gradient_checkpointing_enable()  # reduce number of stored activations
+model.enable_input_require_grads()
+
+class CastOutputToFloat(nn.Sequential):
+  def forward(self, x): return super().forward(x).to(torch.float32)
+model.lm_head = CastOutputToFloat(model.lm_head)
+
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+    )
+print_trainable_parameters(model)
+
+
+from peft import LoraConfig, get_peft_model
+if script_args.num_bit == 16 or script_args.num_bit == 32:
+
+  config = LoraConfig(
+      r=16,
+      lora_alpha=32,
+      lora_dropout=0.1,
+      bias="none",
+      task_type="CAUSAL_LM"
+  )
+else:
+  config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=script_args.target_modules,
+    lora_dropout=0.1,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+
+model = get_peft_model(model, config)
 
 # Step 2: Load the dataset
 dataset = load_dataset(script_args.dataset_name)
@@ -127,43 +180,24 @@ train_dataset = dataset['train']
 test_dataset = dataset['test'] 
 dev_dataset = dataset['validation']
 
+print(train_dataset[0])
+
 # Step 3: Define the training arguments
 training_args = TrainingArguments(
-    per_device_train_batch_size=script_args.batch_size,
-    gradient_accumulation_steps=script_args.gradient_accumulation_steps,
+    per_device_train_batch_size=batch,
+    gradient_accumulation_steps=batch,
     learning_rate=script_args.learning_rate,
     logging_steps=script_args.logging_steps,
     num_train_epochs=script_args.num_train_epochs,
     max_steps=script_args.max_steps,
-    report_to=script_args.report_to,
     push_to_hub=script_args.push_to_hub,
     hub_model_id=hub_model_id_str,
     fp16=float_16,
     gradient_checkpointing=script_args.gradient_checkpointing,
     output_dir="output/"+hub_model_id_str,
-    use_cpu=True,
     # TODO: uncomment that on the next release
     # gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
 )
-
-# Step 4: Define the LoraConfig
-if script_args.use_peft:
-    from peft import LoraConfig, get_peft_model
-    
-    target_modeles_list = script_args.target_modules.split(",")
-    print(type(target_modeles_list))
-    print(target_modeles_list)
-
-    peft_config = LoraConfig(
-        r=script_args.peft_lora_r,
-        lora_alpha=script_args.peft_lora_alpha,
-        bias="none",
-        task_type="CAUSAL_LM",
-        # target_modules=target_modeles_list,
-    )
-    model = get_peft_model(model, peft_config)
-else:
-    peft_config = None
 
 # Step 5: Define the Trainer
 trainer = Trainer(
@@ -174,10 +208,16 @@ trainer = Trainer(
     data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
 )
 
+model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+os.environ['TORCH_USE_CUDA_DSA'] = "1"
 
 trainer.train()
 
 # Step 6: Save the model
 trainer.save_model(script_args.output_dir)
+
+
 
 
