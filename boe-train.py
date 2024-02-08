@@ -29,7 +29,8 @@ import transformers
 
 
 tqdm.pandas()
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 # Define and parse arguments.
 @dataclass
@@ -107,8 +108,7 @@ elif script_args.num_bit == 32:
     batch = 4
     hub_model_id_str = script_args.model_name.split("/")[1] + "_32bit_" + str(len(script_args.target_modules))
 
-import os
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+
 
 model = AutoModelForCausalLM.from_pretrained(
     script_args.model_name,
